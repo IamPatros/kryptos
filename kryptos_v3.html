@@ -982,18 +982,17 @@ function openCalDayModal(key,data,day,month,year){
   );
 }
 
-function addCalEntry(pnl){
+async function addCalEntry(pnl){
   const now=new Date();
   const key=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
   if(!calData[key])calData[key]={pnl:0,trades:0,wins:0,losses:0,entries:[]};
   calData[key].pnl+=pnl;calData[key].trades++;
   if(pnl>0)calData[key].wins++;else if(pnl<0)calData[key].losses++;
-  // Store individual trade detail
   const betInp=$('actual-bet');
   const oddsInp=$('actual-odds');
   const actualBet=betInp&&parseFloat(betInp.value)>0?parseFloat(betInp.value):sess.lastBet;
   const actualOdds=oddsInp&&parseInt(oddsInp.value)>0?parseInt(oddsInp.value):(sess.lastDir==='UP'?oddsUp:oddsDn);
-  calData[key].entries.push({
+  const entry={
     time:now.toISOString().substr(11,5)+' UTC',
     dir:sess.lastDir,
     outcome:pnl>0?'WIN':'LOSS',
@@ -1004,8 +1003,20 @@ function addCalEntry(pnl){
     livePrice:liveK?parseFloat(liveK.c):null,
     conf:sess.lastConf||null,
     score:sess.lastScore||null,
-  });
-  try{localStorage.setItem('kryptos_caldata',JSON.stringify(calData));}catch(e){}
+  };
+  calData[key].entries.push(entry);
+  // Save to backend
+  try{
+    await fetch('/api/trades',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        dir:sess.lastDir, outcome:pnl>0?'WIN':'LOSS',
+        betAmount:actualBet, odds:actualOdds, pnl:parseFloat(pnl.toFixed(2)),
+        openPrice:entry.openPrice, conf:sess.lastConf, score:sess.lastScore,
+      })
+    });
+  }catch(e){}
   renderCalendar();
 }
 
@@ -1473,16 +1484,35 @@ function connectWS(){
 }
 
 // ── PREDICTION HISTORY ────────────────────────────────────────────────────
-function loadHistory(){
+async function loadHistory(){
   try{
-    const saved=localStorage.getItem('kryptos_history');
-    if(saved) predHistory=JSON.parse(saved);
-  }catch(e){ predHistory=[]; }
-  renderHistory();
+    const r = await fetch('/api/predictions');
+    if(!r.ok) throw new Error(r.status);
+    const data = await r.json();
+    predHistory = data.predictions.map(p=>({
+      dir: p.dir,
+      conf: p.conf,
+      score: p.score,
+      windowStart: p.windowStart,
+      windowEnd: p.windowEnd,
+      time: p.signalTime,
+      openPrice: p.openPrice,
+      closePrice: p.closePrice,
+      priceDiff: p.priceDiff ? p.priceDiff.toFixed(2) : null,
+      result: p.result,
+      factors: p.factors,
+      mkt: p.marketData,
+    }));
+    renderHistory();
+    log(`Loaded ${predHistory.length} predictions from server`,'ok');
+  }catch(e){
+    log('Could not load predictions from server: '+e.message,'warn');
+    renderHistory();
+  }
 }
 
 function saveHistory(){
-  try{ localStorage.setItem('kryptos_history',JSON.stringify(predHistory)); }catch(e){}
+  // No-op — predictions are saved server-side automatically
 }
 
 function recordPrediction(dir,conf,score,windowStart,openPrice,factors){
@@ -1748,9 +1778,28 @@ function clearHistory(){
 (async()=>{
   log('KRYPTOS v3 initializing...','warn');
   lastWin=Math.floor(Date.now()/(WIN_SECS*1000))*(WIN_SECS*1000);
-  loadHistory();
-  // Load calData from localStorage
-  try{const saved=localStorage.getItem('kryptos_caldata');if(saved)calData=JSON.parse(saved);}catch(e){}
+  await loadHistory();
+  // Load trades from backend into calendar
+  try{
+    const r=await fetch('/api/trades');
+    if(r.ok){
+      const data=await r.json();
+      data.trades.forEach(t=>{
+        const key=t.date;
+        if(!calData[key])calData[key]={pnl:0,trades:0,wins:0,losses:0,entries:[]};
+        calData[key].pnl+=t.pnl||0;
+        calData[key].trades++;
+        if(t.pnl>0)calData[key].wins++;else if(t.pnl<0)calData[key].losses++;
+        calData[key].entries.push({
+          time:t.time,dir:t.dir,outcome:t.outcome,pnl:t.pnl,
+          betAmount:t.betAmount,odds:t.odds,openPrice:t.openPrice,
+          conf:t.conf,score:t.score,
+        });
+      });
+      renderCalendar();
+      log(`Loaded ${data.trades.length} trades from server`,'ok');
+    }
+  }catch(e){ log('Could not load trades: '+e.message,'warn'); }
 
   await Promise.all([loadCandles(),loadMktData()]);
 
@@ -1765,6 +1814,7 @@ function clearHistory(){
   // Refresh intervals
   setInterval(()=>{loadCandles();loadMktData();},10*60*1000);
   setInterval(fetchCoinbase,15000);
+  setInterval(async()=>{ await loadHistory(); renderCalendar(); },5*60*1000); // refresh from server every 5min
   setInterval(fetchPolyOdds,10000); // refresh odds every 10s via CLOB
   setInterval(renderCalendar,60000);
 

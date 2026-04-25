@@ -1,1 +1,1 @@
-# No external dependencies needed — uses Python standard library only
+requests==2.31.0
