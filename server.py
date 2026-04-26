@@ -558,6 +558,109 @@ class KryptosHandler(BaseHTTPRequestHandler):
             })
             return
 
+        # API: trigger signal now (for testing)
+        if path == "/api/trigger":
+            try:
+                result = run_analysis()
+                if result:
+                    ws_s = int(get_window_start() / 1000)
+                    if result["direction"] != "SKIP":
+                        save_prediction(result, ws_s)
+                    self.send_json({
+                        "direction": result["direction"],
+                        "confidence": result["confidence"],
+                        "score": result["score"],
+                        "openPrice": result["open_price"],
+                        "factors": result["factors"],
+                    })
+                else:
+                    self.send_json({"error": "Analysis failed"}, 500)
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+            return
+
+        # API: backfill last N 4H candles as predictions
+        if path == "/api/backfill":
+            try:
+                candles = fetch_candles("4h", 20)
+                saved = 0
+                for i in range(1, min(6, len(candles)-1)):
+                    candle = candles[-(i+1)]  # closed candles
+                    ws_ms = int(candle[0])
+                    we_ms = ws_ms + WIN_SECS * 1000
+                    open_price = float(candle[1])
+                    close_price = float(candle[4])
+
+                    # Run analysis using candles up to this point
+                    hist = candles[:-(i)]
+                    if len(hist) < 15:
+                        continue
+
+                    # Quick score calculation for historical candle
+                    streak = sum(1 if float(c[4]) >= float(c[1]) else -1 for c in hist[-4:])
+                    cvd_val = calc_cvd(hist[-20:])
+                    rsi_val = calc_rsi(hist, 14)
+
+                    score = 0
+                    if streak >= 2: score += 2
+                    elif streak > 0: score += 1
+                    elif streak <= -2: score -= 2
+                    else: score -= 1
+
+                    if cvd_val > 0: score += 2
+                    else: score -= 2
+
+                    if rsi_val:
+                        if rsi_val < 30: score += 2
+                        elif rsi_val > 70: score -= 2
+                        elif rsi_val > 50: score += 1
+                        else: score -= 1
+
+                    conf = min(90, round(50 + (abs(score) / 10) * 40))
+                    direction = "SKIP"
+                    if conf >= 60 and abs(score) >= 3:
+                        direction = "UP" if score > 0 else "DOWN"
+
+                    if direction == "SKIP":
+                        continue
+
+                    price_diff = close_price - open_price
+                    actual_up = close_price >= open_price
+                    result_str = "correct" if (
+                        (direction == "UP" and actual_up) or
+                        (direction == "DOWN" and not actual_up)
+                    ) else "wrong"
+
+                    signal_time = datetime.fromtimestamp((ws_ms/1000) + SIG_AT, tz=timezone.utc).strftime("%H:%M UTC")
+
+                    conn = get_db()
+                    c = conn.cursor()
+                    c.execute("SELECT id FROM predictions WHERE window_start=?", (ws_ms,))
+                    if not c.fetchone():
+                        c.execute("""
+                            INSERT INTO predictions
+                            (window_start, window_end, signal_time, direction, confidence, score,
+                             open_price, close_price, price_diff, result, factors, market_data)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                        """, (
+                            ws_ms, we_ms, signal_time, direction, conf, score,
+                            open_price, close_price, price_diff, result_str,
+                            json.dumps([
+                                {"n": "Candle Streak", "sc": 2 if streak >= 2 else 1 if streak > 0 else -2 if streak <= -2 else -1, "val": f"{streak:+d} streak"},
+                                {"n": "CVD", "sc": 2 if cvd_val > 0 else -2, "val": f"Net {'buying' if cvd_val > 0 else 'selling'}"},
+                                {"n": "RSI 4H", "sc": 2 if rsi_val and rsi_val < 30 else -2 if rsi_val and rsi_val > 70 else 1 if rsi_val and rsi_val > 50 else -1, "val": f"{rsi_val:.1f}" if rsi_val else "—"},
+                            ]),
+                            json.dumps({})
+                        ))
+                        conn.commit()
+                        saved += 1
+                    conn.close()
+
+                self.send_json({"success": True, "saved": saved})
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+            return
+
         self.send_json({"error": "Not found"}, 404)
 
     def do_POST(self):
